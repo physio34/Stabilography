@@ -1,0 +1,67 @@
+# --- Виртуальные окружения ---
+venv/
+.venv/
+env/
+ENV/
+*.env
+.env.local
+.env.*.local
+! .env.example
+
+# --- Python байт‑код ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Сборка и дистрибутивы ---
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+
+# --- Тестирование и покрытие ---
+.pytest_cache/
+.coverage
+coverage.xml
+.hypothesis/
+
+# --- Статический анализ и линтеры ---
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+
+# --- Jupyter / ноутбуки ---
+.ipynb_checkpoints/
+
+# --- IDE и редакторы ---
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Системные файлы ОС ---
+.DS_Store
+Thumbs.db
+
+# --- Логи и временные файлы ---
+*.log
+logs/
+tmp/
+temp/
+
+# --- Прочее  ---
+.pdm-python
+.pixi/
+__pypackages__/
+*.xlsx
+*.ipynb
+analyzer_session.json
+results/*
