@@ -1,10 +1,10 @@
 """
-Расширенный анализатор стабилограмм для постурографии.
+Быстрый анализатор стабилограмм для постурографии.
 
 Реализует:
 - Итоговый лист с 4 панелями: траектория, X(t), Y(t), гистограммы X и Y
 - Эллипс доверия 95% на графике траектории
-- Спектральный анализ FFT с выделением значимых диапазонов
+- Спектральный анализ FFT с выделением клинических диапазонов
 - Стабилограф Ромберга (коэффициент Ромберга)
 - Нормограмма (возрастно-половые нормы)
 - Экспорт интерактивного HTML-отчёта (Plotly, встроенный)
@@ -30,9 +30,6 @@ logger = logging.getLogger(__name__)
 CHI_SQUARE_95 = 2.4477
 TREMOR_POSTURAL_RANGE = (0.1, 3.0)
 TREMOR_PARKINSONIAN_RANGE = (3.0, 12.0)
-DEFAULT_ARTIFACT_THRESHOLD = 10.0
-DEFAULT_ARTIFACT_WINDOW = 10
-HISTOGRAM_BINS = 50
 
 
 def _smart_round(value: float) -> float:
@@ -68,18 +65,16 @@ DEFAULT_NORMS = {
 }
 
 
-def load_stabilogram(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    Загружает данные стабилограммы из CSV или XLSX файла.
-    Поддерживает CSV с метаданными в начале (ID, Gender, Age и т.д.).
-    Возвращает (DataFrame, metadata_dict).
+def load_stabilogram(file_path: Path) -> pd.DataFrame:
+    """Загружает данные стабилограммы из CSV или XLSX файла.
+
+    CSV может начинаться со строк метаданных (с '#' или без):
+    они пропускаются, данные читаются с заголовка, содержащего X и Y.
     """
     logger.info(f"Загрузка данных из: {file_path}")
 
     if not file_path.exists():
         raise FileNotFoundError(f"Файл не найден: {file_path}")
-
-    metadata: Dict[str, str] = {}
 
     if file_path.suffix.lower() == '.csv':
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -87,18 +82,15 @@ def load_stabilogram(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
 
         header_idx = 0
         for i, line in enumerate(lines):
-            cols = [c.strip().lower() for c in line.split(',')]
+            cols = [c.strip().lstrip('#').lower() for c in line.split(',')]
             if 'x' in cols and 'y' in cols:
                 header_idx = i
                 break
-            parts = [p.strip() for p in line.strip().split(',')]
-            if len(parts) == 2:
-                metadata[parts[0].lower()] = parts[1]
 
         from io import StringIO
-        data_text = ''.join(lines[header_idx:])
+        data_lines = [lines[header_idx].lstrip('#')] + lines[header_idx + 1:]
+        data_text = ''.join(data_lines)
         df = pd.read_csv(StringIO(data_text))
-
     elif file_path.suffix.lower() in ['.xlsx', '.xls']:
         df = pd.read_excel(file_path)
     else:
@@ -114,54 +106,7 @@ def load_stabilogram(file_path: Path) -> Tuple[pd.DataFrame, Dict[str, str]]:
         logger.warning("Колонка 'Time' не найдена. Создана искусственная ось времени (50 Гц).")
         df['Time'] = np.arange(len(df)) / 50.0
 
-    if metadata:
-        logger.info(f"Метаданные из файла: {metadata}")
-
-    return df, metadata
-
-
-def reject_artifacts(df: pd.DataFrame, threshold: float = DEFAULT_ARTIFACT_THRESHOLD,
-                     window: int = DEFAULT_ARTIFACT_WINDOW):
-    """
-    Удаляет артефакты — резкие скачки показаний, превышающие порог.
-    Возвращает (df_clean, artifact_mask) — очищенный DataFrame и булеву маску артефактов.
-    """
-    logger.info(f"Пропуск артефактов (порог: {threshold} мм, окно: {window})...")
-    df = df.copy()
-    artifact_mask = np.zeros(len(df), dtype=bool)
-
-    for col in ['X', 'Y']:
-        signal = df[col].values
-        diff = np.abs(np.diff(signal))
-
-        bad_idx = np.where(diff > threshold)[0]
-
-        if window > 1:
-            expanded = set()
-            for idx in bad_idx:
-                for w in range(-window, window + 1):
-                    pos = idx + w
-                    if 0 <= pos < len(signal):
-                        expanded.add(pos)
-            bad_idx = np.array(sorted(expanded))
-        else:
-            bad_idx_all = set(bad_idx)
-            bad_idx_all.update(bad_idx + 1)
-            bad_idx = np.array(sorted(bad_idx_all))
-
-        if len(bad_idx) > 0:
-            artifact_mask[bad_idx] = True
-            good_mask = np.ones(len(signal), dtype=bool)
-            good_mask[bad_idx] = False
-            good_idx = np.where(good_mask)[0]
-            if len(good_idx) >= 2:
-                df.loc[~good_mask, col] = np.interp(
-                    bad_idx, good_idx, signal[good_idx]
-                )
-
-    n_artifacts = np.sum(artifact_mask)
-    logger.info(f"Найдено и исправлено артефактов: {n_artifacts}")
-    return df, artifact_mask
+    return df
 
 
 def compute_psd(signal: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -312,8 +257,9 @@ def load_norms(norms_path: Optional[Path] = None) -> Dict:
     """Загружает нормы из JSON файла или возвращает дефолтные."""
     candidates = []
     if norms_path:
-        candidates.append(norms_path)
+        candidates.append(Path(norms_path))
     candidates.append(Path(__file__).parent / "norms.json")
+    candidates.append(Path(__file__).parent.parent / "norms.json")
 
     for p in candidates:
         if p.exists():
@@ -384,17 +330,16 @@ def _ellipse_points(cov_matrix: np.ndarray, center: np.ndarray,
     return pts[0] + center[0], pts[1] + center[1]
 
 
-def generate_extended_html(
+def generate_report_html(
     df: pd.DataFrame,
     metrics: Dict[str, float],
     romberg_metrics: Optional[Dict[str, float]] = None,
     norm_results: Optional[Dict[str, Dict]] = None,
-    output_path: Path = Path("extended_report.html"),
+    output_path: Path = Path("report.html"),
     patient_info: Optional[Dict] = None,
-    artifact_mask: Optional[np.ndarray] = None,
 ) -> None:
-    """Генерирует расширенный интерактивный HTML-отчёт (Plotly, встроенный)."""
-    logger.info(f"Генерация расширенного HTML-отчёта: {output_path}")
+    """Генерирует интерактивный HTML-отчёт быстрого анализа (Plotly, встроенный)."""
+    logger.info(f"Генерация HTML-отчёта: {output_path}")
 
     x = df['X'].values
     y = df['Y'].values
@@ -466,12 +411,12 @@ def generate_extended_html(
 
     fig.add_trace(go.Histogram(
         x=x, name='Гистограмма X', marker_color='royalblue', opacity=0.7,
-        nbinsx=HISTOGRAM_BINS,
+        nbinsx=50,
     ), row=3, col=1)
 
     fig.add_trace(go.Histogram(
         x=y, name='Гистограмма Y', marker_color='darkorange', opacity=0.7,
-        nbinsx=HISTOGRAM_BINS,
+        nbinsx=50,
     ), row=3, col=2)
 
     fig.add_trace(go.Scatter(
@@ -483,26 +428,6 @@ def generate_extended_html(
         x=freqs_y, y=power_y, mode='lines', name='PSD Y',
         line=dict(color='darkorange', width=1.5),
     ), row=4, col=2)
-
-    if artifact_mask is not None and np.any(artifact_mask):
-        ax = x[artifact_mask]
-        ay = y[artifact_mask]
-        at = time[artifact_mask]
-        fig.add_trace(go.Scatter(
-            x=ax, y=ay, mode='markers', name='Артефакты',
-            marker=dict(size=7, color='red', symbol='x', line=dict(width=1.5)),
-            showlegend=True,
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=at, y=ax, mode='markers', name='Артефакты X',
-            marker=dict(size=5, color='red', symbol='x', line=dict(width=1)),
-            showlegend=False,
-        ), row=2, col=1)
-        fig.add_trace(go.Scatter(
-            x=at, y=ay, mode='markers', name='Артефакты Y',
-            marker=dict(size=5, color='red', symbol='x', line=dict(width=1)),
-            showlegend=False,
-        ), row=2, col=2)
 
     fig.add_vrect(
         x0=TREMOR_POSTURAL_RANGE[0], x1=TREMOR_POSTURAL_RANGE[1],
@@ -554,7 +479,7 @@ def generate_extended_html(
                      matches="y6", side="right")
 
     fig.update_layout(
-        title_text="Расширенный отчёт постурографии",
+        title_text="Отчёт постурографии",
         showlegend=False,
         height=2000,
         width=1100,
@@ -563,7 +488,7 @@ def generate_extended_html(
 
     html_parts = []
     html_parts.append("<html><head><meta charset='utf-8'>")
-    html_parts.append("<title>Расширенный отчёт постурографии</title>")
+    html_parts.append("<title>Отчёт постурографии</title>")
     html_parts.append("<style>")
     html_parts.append("body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; }")
     html_parts.append("h1 { color: #333; text-align: center; }")
@@ -578,7 +503,7 @@ def generate_extended_html(
     html_parts.append(".patient-info { background: #e8f4f8; padding: 15px; border-radius: 8px; margin: 15px 0; }")
     html_parts.append("</style></head><body>")
 
-    html_parts.append("<h1>Расширенный отчёт постурографии</h1>")
+    html_parts.append("<h1>Отчёт постурографии</h1>")
 
     if patient_info:
         html_parts.append("<div class='patient-info'>")
@@ -654,12 +579,19 @@ def generate_extended_html(
     logger.info(f"Отчёт сохранён: {output_path}")
 
 
-def main():
+# Обратная совместимость со старым именем.
+generate_extended_html = generate_report_html
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Расширенный анализ стабилограмм с клиническими заключениями."
+        description="Быстрый анализ стабилограмм."
     )
-    parser.add_argument('input_file', type=str, help='Путь к файлу стабилограммы (CSV/XLSX)')
+    parser.add_argument('input_file', type=str, nargs='?',
+                        help='Путь к файлу стабилограммы (CSV/XLSX); без него — интерактивный выбор')
     parser.add_argument('-o', '--output_dir', type=str, default='.', help='Директория для отчётов')
+    parser.add_argument('--dir', type=str, default=None,
+                        help='Каталог для интерактивного выбора (по умолчанию records/)')
     parser.add_argument('--age', type=int, default=None, help='Возраст пациента (для нормограммы, необязательно)')
     parser.add_argument('--gender', type=str, default=None, choices=['male', 'female'],
                         help='Пол пациента (male/female, необязательно)')
@@ -670,73 +602,57 @@ def main():
     parser.add_argument('--romberg_closed', type=str, default=None,
                         help='Файл стабилограммы с закрытыми глазами (тест Ромберга)')
     parser.add_argument('--patient_name', type=str, default='Не указано', help='Имя пациента')
-    parser.add_argument('--artifact_threshold', type=float, default=None,
-                        help='Порог пропуска артефактов в мм (по умолчанию 10.0; 0 — отключить)')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    input_path = Path(args.input_file)
+    try:
+        from modules.file_select import resolve_input_file
+    except ImportError:
+        from .file_select import resolve_input_file
+    try:
+        input_file = resolve_input_file(args.input_file, args.dir)
+    except KeyboardInterrupt as e:
+        logger.info(str(e))
+        return
+    input_path = Path(input_file)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        df, file_metadata = load_stabilogram(input_path)
-        artifact_mask = None
-
-        if args.artifact_threshold is None or args.artifact_threshold > 0:
-            thr = args.artifact_threshold if args.artifact_threshold else DEFAULT_ARTIFACT_THRESHOLD
-            df, artifact_mask = reject_artifacts(df, threshold=thr)
-
+        df = load_stabilogram(input_path)
         metrics = calculate_metrics(df)
-
-        age = args.age
-        gender = args.gender
-        if age is None and 'age' in file_metadata:
-            try:
-                age = int(file_metadata['age'])
-            except ValueError:
-                pass
-        if gender is None and 'gender' in file_metadata:
-            g = file_metadata['gender'].strip().lower()
-            if g in ('m', 'male', 'м', 'мужской'):
-                gender = 'male'
-            elif g in ('f', 'female', 'ж', 'женский'):
-                gender = 'female'
 
         patient_info = {
             'Имя': args.patient_name,
             'Файл': input_path.name,
         }
-        for k, v in file_metadata.items():
-            if k not in ('gender', 'age'):
-                patient_info[k] = v
-        if age is not None:
-            patient_info['Возраст'] = age
-        if gender is not None:
-            patient_info['Пол'] = 'Мужской' if gender == 'male' else 'Женский'
+        if args.age is not None:
+            patient_info['Возраст'] = args.age
+        if args.gender is not None:
+            patient_info['Пол'] = 'Мужской' if args.gender == 'male' else 'Женский'
 
         romberg_metrics = None
         if args.romberg_open and args.romberg_closed:
-            df_open, _ = load_stabilogram(Path(args.romberg_open))
-            df_closed, _ = load_stabilogram(Path(args.romberg_closed))
+            df_open = load_stabilogram(Path(args.romberg_open))
+            df_closed = load_stabilogram(Path(args.romberg_closed))
             romberg_metrics = compute_romberg_coefficient(df_open, df_closed)
             patient_info['Тест Ромберга'] = 'Выполнен'
 
         norm_results = None
-        if age is not None and gender is not None:
+        if args.age is not None and args.gender is not None:
             norms_path = Path(args.norms) if args.norms else None
             norms = load_norms(norms_path)
-            norm_results = check_norms(metrics, age, gender, norms)
+            norm_results = check_norms(metrics, args.age, args.gender, norms)
         else:
             logger.info("Возраст/пол не указаны — нормограмма пропущена.")
 
-        html_path = output_dir / f"{input_path.stem}_extended_report.html"
-        generate_extended_html(
+        html_path = output_dir / f"{input_path.stem}_report.html"
+        generate_report_html(
             df, metrics, romberg_metrics, norm_results,
-            html_path, patient_info, artifact_mask,
+            html_path, patient_info,
         )
 
-        logger.info("Анализ завершён успешно!")
+        logger.info("Быстрый анализ завершён успешно!")
 
     except Exception as e:
         logger.error(f"Ошибка: {e}", exc_info=True)

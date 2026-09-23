@@ -12,9 +12,9 @@
 import argparse
 import collections
 import contextlib
-import fcntl
 import json
 import os
+import re
 import select
 import struct
 import subprocess
@@ -25,6 +25,11 @@ import time
 import numpy as np
 import pandas as pd
 import dearpygui.dearpygui as dpg
+
+try:
+    from modules.config import resolve_out_path
+except ImportError:  # python -m modules.gui / прямой запуск
+    from .config import resolve_out_path
 
 # ── evdev constants ────────────────────────────────────────────────────────────
 EV_ABS = 3
@@ -54,6 +59,16 @@ _FONT_CANDIDATES = [
 ]
 
 
+if sys.platform.startswith('win'):
+    # Логика для Windows (без fcntl)
+    def lock_file(fd):
+        print("Блокировка файла не поддерживается на Windows этим способом")
+else:
+    import fcntl
+    def lock_file(fd):
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Слой устройства
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,6 +90,13 @@ def _read_sysfs_text(path: str) -> str | None:
 
 
 def discover_device() -> str | None:
+    """Ищет устройство MERA: Linux — /sys/class/input, Windows — COM/HID."""
+    if sys.platform == "win32":
+        return _discover_device_windows()
+    return _discover_device_linux()
+
+
+def _discover_device_linux() -> str | None:
     """Ищет первое устройство с 'MERA' в имени в /sys/class/input."""
     base = "/sys/class/input"
     try:
@@ -88,6 +110,47 @@ def discover_device() -> str | None:
         if devname and "MERA" in devname.upper():
             return os.path.join("/dev/input", name)
     return None
+
+
+def _discover_device_windows() -> str | None:
+    try:
+        import serial.tools.list_ports
+        ports = serial.tools.list_ports.comports()
+        for port in ports:
+            desc = (port.description or "").upper()
+            mfg = (port.manufacturer or "").upper()
+            hwid = (port.hwid or "").upper()
+            if "MERA" in desc or "MERA" in mfg:
+                return port.device
+            if "VID_" in hwid and "PID_" in hwid:
+                if _is_mera_vid_pid(hwid):
+                    return port.device
+    except ImportError:
+        pass
+
+    try:
+        import hid
+        for d in hid.enumerate():
+            prod = (d.get("product_string") or "").upper()
+            mfg = (d.get("manufacturer_string") or "").upper()
+            if "MERA" in prod or "MERA" in mfg:
+                return f"hid://{d['vendor_id']:04x}:{d['product_id']:04x}"
+    except ImportError:
+        pass
+
+    return None
+
+
+def _is_mera_vid_pid(hwid: str) -> bool:
+    known = {
+        "VID_0483", "VID_2342", "VID_1FC9", "VID_03EB",
+        "VID_16C0", "VID_0403", "VID_2A03",
+    }
+    for part in hwid.replace(";", " ").split():
+        up = part.upper()
+        if up.startswith("VID_") and up in known:
+            return True
+    return False
 
 
 def _get_abs_capabilities(dev_path: str) -> list[int] | None:
@@ -114,30 +177,70 @@ def is_likely_stabilo_platform(dev_path: str) -> bool:
 
 
 class Device:
-    """Низкоуровневое чтение evdev + валидация значений."""
+    """Низкоуровневое чтение evdev/HID/serial + валидация значений."""
 
     def __init__(self, path: str, max_x: int | None = None, max_y: int | None = None):
-        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        self._poll = select.poll()
-        self._poll.register(self.fd, select.POLLIN)
-
+        self._path = path
+        self.max_x = max_x
+        self.max_y = max_y
         self._raw: collections.deque = collections.deque(maxlen=400_000)
         self._latest: dict = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
-
-        self.max_x = max_x
-        self.max_y = max_y
-        self.valid_codes: set[int] = set(_get_abs_capabilities(path) or [])
+        self.valid_codes: set[int] = set()
         self.axis_info: dict[int, tuple[int, int]] = {}
+        self._backend: str | None = None
+        self._serial = None
+        self._hid = None
+        self._prev_x: int | None = None
+        self._prev_y: int | None = None
+        self._accum_x: int = 0
+        self._accum_y: int = 0
 
+        if sys.platform == "win32" and not path.startswith("/dev/"):
+            self._init_windows(path)
+        else:
+            self._init_linux(path)
+
+    def _init_linux(self, path: str):
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self._poll = select.poll()
+        self._poll.register(self.fd, select.POLLIN)
+        self._backend = "linux"
+        self.valid_codes = set(_get_abs_capabilities(path) or [])
         for code in list(self.valid_codes):
             try:
                 _, mn, mx, _, _, _ = _eviocgabs(self.fd, code)
                 self.axis_info[code] = (mn, mx)
             except (IOError, OSError, ValueError):
                 pass
+
+    def _init_windows(self, path: str):
+        if path.startswith("hid://"):
+            import re
+            m = re.search(r"hid://([0-9a-fA-F]+):([0-9a-fA-F]+)", path)
+            if not m:
+                print(f"Неверный формат HID-адреса: {path} (ожидается hid://VID:PID)", file=sys.stderr)
+                sys.exit(1)
+            vid, pid = int(m.group(1), 16), int(m.group(2), 16)
+            import hid
+            self._hid = hid.device()
+            self._hid.open(vid, pid)
+            self._hid.set_nonblocking(True)
+            self._backend = "hid"
+            return
+
+        try:
+            import serial
+            self._serial = serial.Serial(path, baudrate=115200, timeout=0)
+            self._backend = "serial"
+        except ImportError:
+            print("Для работы на Windows установите pyserial: pip install pyserial", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Не удалось открыть {path}: {e}", file=sys.stderr)
+            sys.exit(1)
 
     def start(self):
         self._thread.start()
@@ -146,8 +249,19 @@ class Device:
         self._stop.set()
 
     def close(self):
-        with contextlib.suppress(OSError):
-            os.close(self.fd)
+        if self._backend == "hid" and self._hid:
+            try:
+                self._hid.close()
+            except Exception:
+                pass
+        elif self._backend == "serial" and self._serial:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+        elif self._backend == "linux":
+            with contextlib.suppress(OSError):
+                os.close(self.fd)
 
     def get(self, code: int) -> tuple[int | None, float]:
         """Возвращает (last_value, timestamp)."""
@@ -178,6 +292,14 @@ class Device:
         return True
 
     def _run(self):
+        if self._backend == "hid":
+            self._run_hid()
+        elif self._backend == "serial":
+            self._run_serial()
+        else:
+            self._run_linux()
+
+    def _run_linux(self):
         while not self._stop.is_set():
             if not self._poll.poll(100):
                 continue
@@ -194,6 +316,75 @@ class Device:
                     with self._lock:
                         self._latest[code] = (val, now)
                         self._raw.append((now, code, val))
+
+    def _run_hid(self):
+        buf_size = 64
+        while not self._stop.is_set():
+            try:
+                data = self._hid.read(buf_size)
+            except Exception:
+                time.sleep(0.01)
+                continue
+            if not data:
+                time.sleep(0.01)
+                continue
+            self._parse_hdev_packet(bytes(data))
+
+    def _run_serial(self):
+        buf = bytearray()
+        while not self._stop.is_set():
+            try:
+                n = self._serial.in_waiting
+                if n > 0:
+                    buf.extend(self._serial.read(n))
+                else:
+                    time.sleep(0.005)
+                    continue
+            except Exception:
+                time.sleep(0.01)
+                continue
+            while len(buf) >= 8:
+                if buf[0] == 0xAA and len(buf) >= 8:
+                    packet = bytes(buf[:8])
+                    del buf[:8]
+                    self._parse_hdev_packet(packet)
+                else:
+                    buf.pop(0)
+
+    def _parse_hdev_packet(self, data: bytes):
+        now = time.time()
+        if len(data) < 64:
+            return
+        raw_x, raw_y = data[1], data[2]
+        contact = 1 if data[63] == 0x40 else 0
+
+        if self._prev_x is not None:
+            dx = raw_x - self._prev_x
+            if dx > 128:
+                dx -= 256
+            elif dx < -128:
+                dx += 256
+            self._accum_x += dx
+        else:
+            self._accum_x = raw_x
+        self._prev_x = raw_x
+
+        if self._prev_y is not None:
+            dy = raw_y - self._prev_y
+            if dy > 128:
+                dy -= 256
+            elif dy < -128:
+                dy += 256
+            self._accum_y += dy
+        else:
+            self._accum_y = raw_y
+        self._prev_y = raw_y
+
+        with self._lock:
+            self._latest[0] = (self._accum_x, now)
+            self._latest[1] = (self._accum_y, now)
+            self._raw.append((now, 0, self._accum_x))
+            self._raw.append((now, 1, self._accum_y))
 
 
 def auto_detect_axes(dev: Device, window_sec: float) -> tuple[int, int]:
@@ -243,13 +434,34 @@ class DataBuffer:
         self._interval = 1.0 / cfg["rate"]
         self.running = True
 
+        # Фильтрация
+        self._median_win = max(int(cfg.get("median_window", 3)), 1)
+        self._outlier_sigma = float(cfg.get("outlier_sigma", 5.0))
+        self._buf_x: collections.deque = collections.deque(maxlen=self._median_win)
+        self._buf_y: collections.deque = collections.deque(maxlen=self._median_win)
+        self._running_mean_x = 0.0
+        self._running_mean_y = 0.0
+        self._running_var_x = 1.0
+        self._running_var_y = 1.0
+        self._n_seen = 0
+
     @property
     def elapsed(self) -> float:
         return time.time() - self._start
 
+    @staticmethod
+    def _median(buf: collections.deque) -> float:
+        s = sorted(buf)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        if n % 2 == 1:
+            return s[n // 2]
+        return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
     def sample_once(self) -> bool:
         """Берёт один отсчёт, если прошёл нужный интервал.
-        Возвращает True, если отсчёт добавлен.
+        Применяет медианный фильтр и отсечение выбросов.
         """
         now = time.time()
         if now - self._last_sample < self._interval:
@@ -261,10 +473,37 @@ class DataBuffer:
         if xv[0] is None or yv[0] is None:
             return False
 
-        x = float(xv[0]) * self._cfg["scale_x"] + self._cfg["offset_x"]
-        y = float(yv[0]) * self._cfg["scale_y"] + self._cfg["offset_y"]
+        az = self._cfg["axis_zero"]
+        us = self._cfg["unit_scale"]
+        x_raw = (float(xv[0]) - az) * self._cfg["scale_x"] * us + self._cfg["offset_x"]
+        y_raw = (float(yv[0]) - az) * self._cfg["scale_y"] * us + self._cfg["offset_y"]
+
         last_ts = max(xv[1], yv[1])
         contact = 1.0 if (now - last_ts) < self._cfg["contact_timeout"] else 0.0
+
+        # Отсечение выбросов: если отклонение > outlier_sigma * sqrt(дисперсия) —
+        # пропускаем точку (только если накопили достаточно данных)
+        if self._n_seen >= 10 and self._outlier_sigma > 0:
+            dx = abs(x_raw - self._running_mean_x)
+            dy = abs(y_raw - self._running_mean_y)
+            std_x = max(self._running_var_x, 1e-10) ** 0.5
+            std_y = max(self._running_var_y, 1e-10) ** 0.5
+            if dx > self._outlier_sigma * std_x or dy > self._outlier_sigma * std_y:
+                return False
+
+        # Медианный фильтр
+        self._buf_x.append(x_raw)
+        self._buf_y.append(y_raw)
+        x = self._median(self._buf_x)
+        y = self._median(self._buf_y)
+
+        # Бегущее среднее и дисперсия (exponential moving average)
+        alpha = 0.02
+        self._n_seen += 1
+        self._running_mean_x += alpha * (x - self._running_mean_x)
+        self._running_mean_y += alpha * (y - self._running_mean_y)
+        self._running_var_x += alpha * ((x - self._running_mean_x) ** 2 - self._running_var_x)
+        self._running_var_y += alpha * ((y - self._running_mean_y) ** 2 - self._running_var_y)
 
         with self._lock:
             self._samples.append((now - self._start, x, y, contact))
@@ -325,11 +564,50 @@ def compute_metrics(arr: np.ndarray) -> dict | None:
     )
 
 
-def save_csv(arr: np.ndarray, path: str):
+def save_csv(arr: np.ndarray, path: str, meta: dict | None = None,
+             t_start: float | None = None, t_end: float | None = None):
     if not path:
         return
-    df = pd.DataFrame(arr[:, :3], columns=["Time", "X", "Y"])
-    df.to_csv(path, index=False, float_format="%.6f")
+    import datetime
+    from pathlib import Path as _Path
+    _Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        if meta:
+            if meta.get("id"):
+                f.write(f"#ID,{meta['id']}\n")
+            if meta.get("gender"):
+                f.write(f"#Gender,{meta['gender']}\n")
+            if meta.get("age"):
+                f.write(f"#Age,{meta['age']}\n")
+        if t_start is not None:
+            utc_start = datetime.datetime.fromtimestamp(t_start, tz=datetime.timezone.utc)
+            f.write(f"#Start_UTC,{utc_start.strftime('%Y-%m-%dT%H:%M:%S.%f')}Z\n")
+        if t_end is not None:
+            utc_end = datetime.datetime.fromtimestamp(t_end, tz=datetime.timezone.utc)
+            f.write(f"#End_UTC,{utc_end.strftime('%Y-%m-%dT%H:%M:%S.%f')}Z\n")
+        f.write("#Time,X,Y\n")
+        for row in arr:
+            f.write(f"{row[0]:.3f},{row[1]:.3f},{row[2]:.3f}\n")
+
+
+def _build_csv_path(base_path: str, meta: dict | None = None,
+                    t_start: float | None = None) -> str:
+    """Создаёт имя CSV-файла: base_YYYYMMDD_HHMMSS[_ID][_G][_Age].csv"""
+    import datetime
+    import os
+    base, ext = os.path.splitext(base_path)
+    parts = [base]
+    if t_start is not None:
+        utc = datetime.datetime.fromtimestamp(t_start, tz=datetime.timezone.utc)
+        parts.append(utc.strftime("%Y%m%d_%H%M%S"))
+    if meta:
+        if meta.get("id"):
+            parts.append(str(meta["id"]).replace(" ", "_"))
+        if meta.get("gender"):
+            parts.append(str(meta["gender"]))
+        if meta.get("age"):
+            parts.append(str(meta["age"]))
+    return "_".join(parts) + ext
 
 
 def print_summary(m: dict | None):
@@ -427,6 +705,10 @@ _CFG_DEFAULTS: dict = {
     "contact_timeout": 0.5, "calibrate": 2.0,
     "scale_x": 1.0, "scale_y": 1.0,
     "offset_x": 0.0, "offset_y": 0.0,
+    "axis_zero": 128,
+    "unit_scale": 0.1,
+    "median_window": 3,
+    "outlier_sigma": 5.0,
     "device": None, "max_x": None, "max_y": None,
 }
 
@@ -470,13 +752,15 @@ class StabiloUI:
     def __init__(self, buf: DataBuffer, cfg: dict, duration: float, out_path: str,
                  axis_range_x: tuple[float, float] | None = None,
                  axis_range_y: tuple[float, float] | None = None,
-                 xinput_id: int | None = None):
+                 xinput_id: int | None = None,
+                 meta: dict | None = None):
         self._buf = buf
         self._cfg = cfg
         self._duration = duration
         self._out_path = out_path
-        self._xinput_id = xinput_id      # для кнопки "Завершить и отключить"
-        self.keep_disabled: list[bool] = [False]  # разделяется с xinput_isolated
+        self._xinput_id = xinput_id
+        self.keep_disabled: list[bool] = [False]
+        self.meta = meta or {}
 
         # Начальные границы — из аппаратного диапазона устройства (axis_info),
         # умноженного на scale.  Если axis_range не передан — просто запоминаем,
@@ -485,17 +769,19 @@ class StabiloUI:
         self._y_min = self._y_max = 0.0
         has_x = axis_range_x is not None
         has_y = axis_range_y is not None
+        az = cfg["axis_zero"]
+        us = cfg["unit_scale"]
         if has_x:
             raw_min, raw_max = axis_range_x
             sx = cfg["scale_x"]
-            cx = (raw_min + raw_max) / 2 * sx + cfg["offset_x"]
-            half = (raw_max - raw_min) / 2 * sx * 0.6 or 20.0
+            cx = ((raw_min + raw_max) / 2 - az) * sx * us + cfg["offset_x"]
+            half = (raw_max - raw_min) / 2 * sx * us * 0.6 or 0.2
             self._x_min, self._x_max = cx - half, cx + half
         if has_y:
             raw_min, raw_max = axis_range_y
             sy = cfg["scale_y"]
-            cy = (raw_min + raw_max) / 2 * sy + cfg["offset_y"]
-            half = (raw_max - raw_min) / 2 * sy * 0.6 or 20.0
+            cy = ((raw_min + raw_max) / 2 - az) * sy * us + cfg["offset_y"]
+            half = (raw_max - raw_min) / 2 * sy * us * 0.6 or 0.2
             self._y_min, self._y_max = cy - half, cy + half
         self._bounds_init = has_x or has_y
 
@@ -503,7 +789,7 @@ class StabiloUI:
 
     def _build(self):
         th_traj_line   = _make_line_theme(COLOR_TRAJ_LINE)
-        th_traj_pts    = _make_scatter_theme(COLOR_TRAJ_PTS, marker_size=3)
+        th_traj_pts    = _make_line_theme(COLOR_TRAJ_PTS)
         th_cursor      = _make_scatter_theme(COLOR_CURSOR, marker_size=8)
         th_x_line      = _make_line_theme(COLOR_X_LINE)
         th_y_line      = _make_line_theme(COLOR_Y_LINE)
@@ -539,8 +825,8 @@ class StabiloUI:
                                        tag="traj_line", parent="traj_y")
                     dpg.bind_item_theme("traj_line", th_traj_line)
 
-                    dpg.add_scatter_series([], [], label="points",
-                                          tag="traj_pts", parent="traj_y")
+                    dpg.add_line_series([], [], label="points",
+                                      tag="traj_pts", parent="traj_y")
                     dpg.bind_item_theme("traj_pts", th_traj_pts)
 
                     dpg.add_scatter_series([], [], label="current",
@@ -621,7 +907,7 @@ class StabiloUI:
         # Масштаб: берём максимальный охват за всю сессию.
         # Минимальный полуразмах окна — 20 единиц (чтобы при малых колебаниях
         # не было чрезмерного увеличения).
-        MIN_HALF = 20.0
+        MIN_HALF = 0.2
         span_x = max((xs.max() - xs.min()) * 0.55, MIN_HALF)
         span_y = max((ys.max() - ys.min()) * 0.55, MIN_HALF)
         # Центр — текущее среднее
@@ -664,7 +950,7 @@ class StabiloUI:
         if len(vals):
             val_range = vals.max() - vals.min()
             # Минимальный полурасстояние — 5% от полного диапазона оси или 2 единицы
-            v_margin = max(val_range * 0.15, 2.0)
+            v_margin = max(val_range * 0.15, 0.02)
             dpg.set_axis_limits("time_y",
                                 float(vals.min()) - v_margin,
                                 float(vals.max()) + v_margin)
@@ -720,23 +1006,56 @@ class StabiloUI:
             font = dpg.add_font(font_path, 16)
         dpg.bind_font(font)
 
+    def _build_meta_dialog(self):
+        """Модальное окно ввода метаданных (ID, пол, возраст)."""
+        with dpg.window(label="Patient Data", tag="meta_win",
+                        modal=True, no_close=True,
+                        width=350, height=220, pos=[460, 220]):
+            dpg.add_text("Enter patient data:")
+            dpg.add_input_text(label="ID",   tag="meta_id",   width=250)
+            dpg.add_combo(["M", "F"], label="Gender", tag="meta_gender",
+                          default_value="M", width=250)
+            dpg.add_input_int(label="Age", tag="meta_age",
+                              default_value=30, min_value=0, max_value=150,
+                              width=250)
+            dpg.add_button(label="Start", callback=self._on_meta_submit,
+                           width=250, height=30)
+
+    def _on_meta_submit(self, *args):
+        self.meta = {
+            "id":     dpg.get_value("meta_id"),
+            "gender": dpg.get_value("meta_gender"),
+            "age":    dpg.get_value("meta_age"),
+        }
+        dpg.delete_item("meta_win")
+
     def run(self) -> tuple[np.ndarray, dict | None]:
         dpg.create_context()
         dpg.create_viewport(title="Stabilogram MERA", width=1280, height=660)
         dpg.setup_dearpygui()
 
         self._load_font()
+        self._build_meta_dialog()
         self._build()
 
-        # Горячие клавиши — на уровне stage (DearPyGui 2.x требует mvStage)
+        # Горячие клавиши — на уровне stage
         with dpg.handler_registry():
             dpg.add_key_press_handler(dpg.mvKey_Q,      callback=self._on_key_press)
             dpg.add_key_press_handler(dpg.mvKey_Escape,  callback=self._on_key_press)
 
-        dpg.set_primary_window("main_win", True)
+        dpg.set_primary_window("main_win", False)
         dpg.show_viewport()
 
-        # Поток дискретизации
+        # Показываем модальный диалог, ждём нажатия Start
+        while dpg.is_dearpygui_running():
+            dpg.render_dearpygui_frame()
+            if not dpg.does_item_exist("meta_win"):
+                break
+            time.sleep(0.02)
+
+        # После закрытия диалога — запускаем основное окно
+        dpg.set_primary_window("main_win", True)
+
         sample_thread = threading.Thread(
             target=self._buf.sample_loop, daemon=True
         )
@@ -754,11 +1073,18 @@ class StabiloUI:
     def _finalize(self) -> tuple[np.ndarray, dict | None]:
         arr = self._buf.to_array()
         m   = compute_metrics(arr)
-        save_csv(arr, self._out_path)
+        t_start = self._buf._start
+        t_end = time.time()
+        out_path = _build_csv_path(self._out_path, meta=self.meta, t_start=t_start)
+        save_csv(arr, out_path, meta=self.meta, t_start=t_start, t_end=t_end)
         print_summary(m)
-        print(f"\nСохранён CSV: {self._out_path}")
+        print(f"\nCSV: {out_path}")
+        if self.meta:
+            print(f"Patient: {self.meta.get('id', '-')}, "
+                  f"{self.meta.get('gender', '-')}, "
+                  f"{self.meta.get('age', '-')} y.o.")
         if m:
-            print(f"Длительность: {m['T']:.2f} с, отсчётов: {m['n']}")
+            print(f"Duration: {m['T']:.2f} s, samples: {m['n']}")
         return arr, m
 
 
@@ -766,7 +1092,8 @@ class StabiloUI:
 # Headless-режим
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_headless(buf: DataBuffer, duration: float, out_path: str):
+def run_headless(buf: DataBuffer, duration: float, out_path: str,
+                 meta: dict | None = None):
     print("Headless-режим: Ctrl-C для остановки...")
     sample_thread = threading.Thread(target=buf.sample_loop, daemon=True)
     sample_thread.start()
@@ -780,32 +1107,100 @@ def run_headless(buf: DataBuffer, duration: float, out_path: str):
     buf.stop()
     arr = buf.to_array()
     m = compute_metrics(arr)
-    save_csv(arr, out_path)
+    t_start = buf._start
+    t_end = time.time()
+    out_path = _build_csv_path(out_path, meta=meta, t_start=t_start)
+    save_csv(arr, out_path, meta=meta, t_start=t_start, t_end=t_end)
     print_summary(m)
-    print(f"\nСохранён CSV: {out_path}")
+    print(f"\nCSV: {out_path}")
+
+
+def _cmd_sniff(args):
+    """Открывает HID-устройство и выводит сырые пакеты в hex."""
+    import re
+    path = args.device
+    if not path:
+        path = discover_device()
+    if not path:
+        print("Устройство не найдено.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Устройство: {path}")
+
+    if path.startswith("hid://"):
+        import hid as hid_mod
+        m = re.search(r"hid://([0-9a-fA-F]+):([0-9a-fA-F]+)", path)
+        if not m:
+            print(f"Неверный HID-адрес: {path}", file=sys.stderr)
+            sys.exit(1)
+        vid, pid = int(m.group(1), 16), int(m.group(2), 16)
+        dev = hid_mod.device()
+        dev.open(vid, pid)
+        dev.set_nonblocking(True)
+        print(f"HID открыт: VID={vid:04x} PID={pid:04x}")
+        print("Сырые пакеты (Ctrl-C для остановки):\n")
+        try:
+            pkt_count = 0
+            while True:
+                data = dev.read(64)
+                if data:
+                    pkt_count += 1
+                    raw = bytes(data)
+                    hex_str = raw.hex(" ")
+                    ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in raw)
+                    print(f"[{pkt_count:5d}] len={len(raw):2d}  hex={hex_str}")
+                    print(f"       ascii={ascii_str}")
+                    if pkt_count <= 10:
+                        print(f"       bin={raw!r}")
+                else:
+                    import time
+                    time.sleep(0.01)
+        except KeyboardInterrupt:
+            print(f"\nВсего пакетов: {pkt_count}")
+        finally:
+            dev.close()
+    else:
+        print(f"sniff пока поддерживает только HID-устройства (получен: {path})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Точка входа
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Стабилограмма MERA (Dear PyGui)")
-    ap.add_argument("--device",   help="путь к /dev/input/eventN")
+    ap.add_argument("--device",   help="путь к устройству (Linux: /dev/input/eventN, Windows: COM-порт или hid://VID:PID)")
     ap.add_argument("--axes",     help="JSON-конфиг осей и калибровки")
     ap.add_argument("--rate",     type=float, default=0,  help="частота, Гц")
     ap.add_argument("--duration", type=float, default=0,  help="авто-стоп, с (0=бесконечно)")
-    ap.add_argument("--out",      default="stabilo.csv",  help="выходной CSV")
+    ap.add_argument("--out",      default="stabilo.csv",  help="выходной CSV (имя без пути -> каталог records/)")
     ap.add_argument("--no-gui",   action="store_true",    help="headless-режим")
+    ap.add_argument("--id",       default="", help="ID пациента")
+    ap.add_argument("--gender",   default="", help="пол (M/F)")
+    ap.add_argument("--age",      type=int, default=0,    help="возраст")
+    ap.add_argument("--unit-scale", type=float, default=0, help="масштаб единиц (0.01=деление на 100, мм)")
+    ap.add_argument("--median",   type=int, default=0,    help="окно медианного фильтра (0=3)")
+    ap.add_argument("--outlier",  type=float, default=0,  help="порог выбросов в sigma (0=5.0)")
+    ap.add_argument("--debug",    action="store_true",    help="hex-dump сырых HID-пакетов")
     ap.add_argument("command",    nargs="?", default="live",
-                    choices=["live", "list"], help="режим")
-    args = ap.parse_args()
+                    choices=["live", "list", "sniff"], help="режим: live/list/sniff")
+    args = ap.parse_args(argv)
+    args.out = str(resolve_out_path(args.out))
 
     cfg = load_config(args.axes)
     if args.device:
         cfg["device"] = args.device
     if args.rate > 0:
         cfg["rate"] = args.rate
+    if args.unit_scale > 0:
+        cfg["unit_scale"] = args.unit_scale
+    if args.median > 0:
+        cfg["median_window"] = args.median
+    if args.outlier > 0:
+        cfg["outlier_sigma"] = args.outlier
+
+    if args.command == "sniff":
+        _cmd_sniff(args)
+        return
 
     if args.command == "list":
         d = discover_device()
@@ -814,11 +1209,13 @@ def main():
 
     path = cfg["device"] or discover_device()
     if not path:
-        print("Устройство MERA не найдено. Укажите --device /dev/input/eventN",
-              file=sys.stderr)
+        if sys.platform == "win32":
+            print("Устройство MERA не найдено. Укажите --device COM3 (или другой COM-порт)", file=sys.stderr)
+        else:
+            print("Устройство MERA не найдено. Укажите --device /dev/input/eventN", file=sys.stderr)
         sys.exit(1)
 
-    if not is_likely_stabilo_platform(path):
+    if sys.platform != "win32" and not is_likely_stabilo_platform(path):
         print(f"Предупреждение: {path} похож на тачпад или мышь.", file=sys.stderr)
 
     try:
@@ -835,8 +1232,10 @@ def main():
 
     buf = DataBuffer(cfg, dev, xcode, ycode)
 
+    meta = {"id": args.id, "gender": args.gender, "age": args.age}
+
     if args.no_gui:
-        run_headless(buf, args.duration, args.out)
+        run_headless(buf, args.duration, args.out, meta=meta)
         dev.stop_now()
         dev.close()
         return
@@ -854,6 +1253,7 @@ def main():
         axis_range_x=ax_range_x,
         axis_range_y=ax_range_y,
         xinput_id=xinput_id,
+        meta=meta,
     )
     with xinput_isolated("MERA", keep_disabled=ui.keep_disabled):
         ui.run()

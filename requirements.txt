@@ -1,0 +1,16 @@
+# adStabilo — зависимости (Python 3.9+)
+# Установка: pip install -r requirements.txt
+
+# --- Анализ и запись (обязательные) ---
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+plotly>=5.18
+openpyxl>=3.1          # чтение XLSX-стабилограмм (pd.read_excel)
+
+# --- GUI-запись (команда `python main.py gui`) ---
+dearpygui>=2.0
+
+# --- Windows: поиск/чтение платформы MERA (опционально, импорт с fallback) ---
+pyserial>=3.5          # COM-порты
+hid>=1.0               # HID-устройства (import hid)
