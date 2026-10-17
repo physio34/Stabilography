@@ -1,42 +1,33 @@
 #!/usr/bin/env python3
-"""Стабилограмма MERA с Dear PyGui.
+"""Стабилограмма MERA с Dear PyGui — только UI-фронтенд.
 
-Архитектура (Loose Coupling):
-  Device        — чтение evdev, валидация, кольцевой буфер
-  DataBuffer    — накопление, дискретизация, вычисление метрик
-  XInputGuard   — изоляция устройства ввода от X11 (контекст-менеджер)
-  StabiloUI     — только Dear PyGui / визуализация
-  main()        — сборка и запуск
+Ядро (устройство, семплирование, метрики, CSV) — в modules.core.
 """
 
 import argparse
-import collections
 import contextlib
-import json
 import os
-import re
-import select
-import struct
 import subprocess
 import sys
 import threading
 import time
 
 import numpy as np
-import pandas as pd
 import dearpygui.dearpygui as dpg
 
-try:
-    from modules.config import resolve_out_path
-except ImportError:  # python -m modules.gui / прямой запуск
-    from .config import resolve_out_path
-
-# ── evdev constants ────────────────────────────────────────────────────────────
-EV_ABS = 3
-EVENT_FMT = "llHHi"
-EVENT_SIZE = struct.calcsize(EVENT_FMT)
-ABSINFO_FMT = "iiiiii"
-ABSINFO_SIZE = struct.calcsize(ABSINFO_FMT)
+from modules.core import (
+    DataBuffer,
+    Device,
+    auto_detect_axes,
+    build_csv_path,
+    compute_metrics,
+    discover_device,
+    is_likely_stabilo_platform,
+    load_config,
+    print_summary,
+    save_csv,
+)
+from modules.config import resolve_out_path
 
 # ── цвета UI ───────────────────────────────────────────────────────────────────
 COLOR_TRAJ_LINE   = [128, 128, 128, 102]
@@ -57,580 +48,6 @@ _FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 ]
-
-
-if sys.platform.startswith('win'):
-    # Логика для Windows (без fcntl)
-    def lock_file(fd):
-        print("Блокировка файла не поддерживается на Windows этим способом")
-else:
-    import fcntl
-    def lock_file(fd):
-        fcntl.flock(fd, fcntl.LOCK_EX)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Слой устройства
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _eviocgabs(fd: int, code: int) -> tuple:
-    """Возвращает (value, min, max, fuzz, flat, resolution) оси evdev."""
-    request = (2 << 30) | (ABSINFO_SIZE << 16) | (ord("E") << 8) | (0x40 + code)
-    buf = bytearray(ABSINFO_SIZE)
-    fcntl.ioctl(fd, request, buf)
-    return struct.unpack(ABSINFO_FMT, buf)
-
-
-def _read_sysfs_text(path: str) -> str | None:
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return None
-
-
-def discover_device() -> str | None:
-    """Ищет устройство MERA: Linux — /sys/class/input, Windows — COM/HID."""
-    if sys.platform == "win32":
-        return _discover_device_windows()
-    return _discover_device_linux()
-
-
-def _discover_device_linux() -> str | None:
-    """Ищет первое устройство с 'MERA' в имени в /sys/class/input."""
-    base = "/sys/class/input"
-    try:
-        names = os.listdir(base)
-    except OSError:
-        return None
-    for name in sorted(names):
-        if not name.startswith("event"):
-            continue
-        devname = _read_sysfs_text(os.path.join(base, name, "device", "name"))
-        if devname and "MERA" in devname.upper():
-            return os.path.join("/dev/input", name)
-    return None
-
-
-def _discover_device_windows() -> str | None:
-    try:
-        import serial.tools.list_ports
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            desc = (port.description or "").upper()
-            mfg = (port.manufacturer or "").upper()
-            hwid = (port.hwid or "").upper()
-            if "MERA" in desc or "MERA" in mfg:
-                return port.device
-            if "VID_" in hwid and "PID_" in hwid:
-                if _is_mera_vid_pid(hwid):
-                    return port.device
-    except ImportError:
-        pass
-
-    try:
-        import hid
-        for d in hid.enumerate():
-            prod = (d.get("product_string") or "").upper()
-            mfg = (d.get("manufacturer_string") or "").upper()
-            if "MERA" in prod or "MERA" in mfg:
-                return f"hid://{d['vendor_id']:04x}:{d['product_id']:04x}"
-    except ImportError:
-        pass
-
-    return None
-
-
-def _is_mera_vid_pid(hwid: str) -> bool:
-    known = {
-        "VID_0483", "VID_2342", "VID_1FC9", "VID_03EB",
-        "VID_16C0", "VID_0403", "VID_2A03",
-    }
-    for part in hwid.replace(";", " ").split():
-        up = part.upper()
-        if up.startswith("VID_") and up in known:
-            return True
-    return False
-
-
-def _get_abs_capabilities(dev_path: str) -> list[int] | None:
-    """Возвращает список кодов ABS-осей устройства."""
-    sys_path = dev_path.replace("/dev/input/", "/sys/class/input/")
-    cap_hex = _read_sysfs_text(os.path.join(sys_path, "device", "capabilities", "abs"))
-    if cap_hex is None:
-        return None
-    try:
-        cap_val = int(cap_hex, 16)
-        return [i for i in range(64) if cap_val & (1 << i)]
-    except ValueError:
-        return None
-
-
-def is_likely_stabilo_platform(dev_path: str) -> bool:
-    """Эвристика: стабилограф имеет ≤5 осей без мультитач-кодов 47–63."""
-    caps = _get_abs_capabilities(dev_path)
-    if caps is None:
-        return True
-    if len(caps) > 5:
-        return False
-    return not any(c in range(47, 64) for c in caps)
-
-
-class Device:
-    """Низкоуровневое чтение evdev/HID/serial + валидация значений."""
-
-    def __init__(self, path: str, max_x: int | None = None, max_y: int | None = None):
-        self._path = path
-        self.max_x = max_x
-        self.max_y = max_y
-        self._raw: collections.deque = collections.deque(maxlen=400_000)
-        self._latest: dict = {}
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self.valid_codes: set[int] = set()
-        self.axis_info: dict[int, tuple[int, int]] = {}
-        self._backend: str | None = None
-        self._serial = None
-        self._hid = None
-        self._prev_x: int | None = None
-        self._prev_y: int | None = None
-        self._accum_x: int = 0
-        self._accum_y: int = 0
-
-        if sys.platform == "win32" and not path.startswith("/dev/"):
-            self._init_windows(path)
-        else:
-            self._init_linux(path)
-
-    def _init_linux(self, path: str):
-        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        self._poll = select.poll()
-        self._poll.register(self.fd, select.POLLIN)
-        self._backend = "linux"
-        self.valid_codes = set(_get_abs_capabilities(path) or [])
-        for code in list(self.valid_codes):
-            try:
-                _, mn, mx, _, _, _ = _eviocgabs(self.fd, code)
-                self.axis_info[code] = (mn, mx)
-            except (IOError, OSError, ValueError):
-                pass
-
-    def _init_windows(self, path: str):
-        if path.startswith("hid://"):
-            import re
-            m = re.search(r"hid://([0-9a-fA-F]+):([0-9a-fA-F]+)", path)
-            if not m:
-                print(f"Неверный формат HID-адреса: {path} (ожидается hid://VID:PID)", file=sys.stderr)
-                sys.exit(1)
-            vid, pid = int(m.group(1), 16), int(m.group(2), 16)
-            import hid
-            self._hid = hid.device()
-            self._hid.open(vid, pid)
-            self._hid.set_nonblocking(True)
-            self._backend = "hid"
-            return
-
-        try:
-            import serial
-            self._serial = serial.Serial(path, baudrate=115200, timeout=0)
-            self._backend = "serial"
-        except ImportError:
-            print("Для работы на Windows установите pyserial: pip install pyserial", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Не удалось открыть {path}: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    def start(self):
-        self._thread.start()
-
-    def stop_now(self):
-        self._stop.set()
-
-    def close(self):
-        if self._backend == "hid" and self._hid:
-            try:
-                self._hid.close()
-            except Exception:
-                pass
-        elif self._backend == "serial" and self._serial:
-            try:
-                self._serial.close()
-            except Exception:
-                pass
-        elif self._backend == "linux":
-            with contextlib.suppress(OSError):
-                os.close(self.fd)
-
-    def get(self, code: int) -> tuple[int | None, float]:
-        """Возвращает (last_value, timestamp)."""
-        with self._lock:
-            return self._latest.get(code, (None, 0.0))
-
-    def recent_codes(self, since: float) -> dict[int, list[int]]:
-        """События по кодам, начиная с момента since."""
-        codes: dict[int, list[int]] = {}
-        with self._lock:
-            items = list(self._raw)
-        for t, code, val in items:
-            if t >= since:
-                codes.setdefault(code, []).append(val)
-        return codes
-
-    def _validate(self, code: int, val: int) -> bool:
-        if self.valid_codes and code not in self.valid_codes:
-            return False
-        if code in self.axis_info:
-            mn, mx = self.axis_info[code]
-            if not (mn <= val <= mx):
-                return False
-        if self.max_x is not None and code == 0 and val > self.max_x:
-            return False
-        if self.max_y is not None and code == 1 and val > self.max_y:
-            return False
-        return True
-
-    def _run(self):
-        if self._backend == "hid":
-            self._run_hid()
-        elif self._backend == "serial":
-            self._run_serial()
-        else:
-            self._run_linux()
-
-    def _run_linux(self):
-        while not self._stop.is_set():
-            if not self._poll.poll(100):
-                continue
-            try:
-                data = os.read(self.fd, EVENT_SIZE * 64)
-            except OSError:
-                continue
-            now = time.time()
-            for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
-                _, _, typ, code, val = struct.unpack(
-                    EVENT_FMT, data[off: off + EVENT_SIZE]
-                )
-                if typ == EV_ABS and self._validate(code, val):
-                    with self._lock:
-                        self._latest[code] = (val, now)
-                        self._raw.append((now, code, val))
-
-    def _run_hid(self):
-        buf_size = 64
-        while not self._stop.is_set():
-            try:
-                data = self._hid.read(buf_size)
-            except Exception:
-                time.sleep(0.01)
-                continue
-            if not data:
-                time.sleep(0.01)
-                continue
-            self._parse_hdev_packet(bytes(data))
-
-    def _run_serial(self):
-        buf = bytearray()
-        while not self._stop.is_set():
-            try:
-                n = self._serial.in_waiting
-                if n > 0:
-                    buf.extend(self._serial.read(n))
-                else:
-                    time.sleep(0.005)
-                    continue
-            except Exception:
-                time.sleep(0.01)
-                continue
-            while len(buf) >= 8:
-                if buf[0] == 0xAA and len(buf) >= 8:
-                    packet = bytes(buf[:8])
-                    del buf[:8]
-                    self._parse_hdev_packet(packet)
-                else:
-                    buf.pop(0)
-
-    def _parse_hdev_packet(self, data: bytes):
-        now = time.time()
-        if len(data) < 64:
-            return
-        raw_x, raw_y = data[1], data[2]
-        contact = 1 if data[63] == 0x40 else 0
-
-        if self._prev_x is not None:
-            dx = raw_x - self._prev_x
-            if dx > 128:
-                dx -= 256
-            elif dx < -128:
-                dx += 256
-            self._accum_x += dx
-        else:
-            self._accum_x = raw_x
-        self._prev_x = raw_x
-
-        if self._prev_y is not None:
-            dy = raw_y - self._prev_y
-            if dy > 128:
-                dy -= 256
-            elif dy < -128:
-                dy += 256
-            self._accum_y += dy
-        else:
-            self._accum_y = raw_y
-        self._prev_y = raw_y
-
-        with self._lock:
-            self._latest[0] = (self._accum_x, now)
-            self._latest[1] = (self._accum_y, now)
-            self._raw.append((now, 0, self._accum_x))
-            self._raw.append((now, 1, self._accum_y))
-
-
-def auto_detect_axes(dev: Device, window_sec: float) -> tuple[int, int]:
-    """Определяет коды X/Y по дисперсии сигнала за window_sec секунд."""
-    since = time.time()
-    time.sleep(window_sec)
-    codes = dev.recent_codes(since)
-    if not codes:
-        print("Предупреждение: нет данных за время калибровки, оси 0 и 1.", file=sys.stderr)
-        return 0, 1
-
-    def _range(code: int) -> int:
-        mn, mx = dev.axis_info.get(code, (0, 0))
-        return mx - mn
-
-    ranked = sorted(
-        codes,
-        key=lambda c: (_range(c), float(np.var(codes[c])) if len(codes[c]) > 1 else 0.0),
-        reverse=True,
-    )
-    if len(ranked) >= 2:
-        return ranked[0], ranked[1]
-    if len(ranked) == 1:
-        return ranked[0], ranked[0]
-    return 0, 1
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Слой данных
-# ══════════════════════════════════════════════════════════════════════════════
-
-class DataBuffer:
-    """Дискретизация, накопление, вычисление метрик.
-    Не зависит от UI и конкретного типа устройства.
-    """
-
-    def __init__(self, cfg: dict, dev: Device, xcode: int, ycode: int):
-        self._cfg = cfg
-        self._dev = dev
-        self._xcode = xcode
-        self._ycode = ycode
-
-        self._samples: list[tuple[float, float, float, float]] = []
-        self._lock = threading.Lock()
-        self._start = time.time()
-        self._last_sample = 0.0
-        self._interval = 1.0 / cfg["rate"]
-        self.running = True
-
-        # Фильтрация
-        self._median_win = max(int(cfg.get("median_window", 3)), 1)
-        self._outlier_sigma = float(cfg.get("outlier_sigma", 5.0))
-        self._buf_x: collections.deque = collections.deque(maxlen=self._median_win)
-        self._buf_y: collections.deque = collections.deque(maxlen=self._median_win)
-        self._running_mean_x = 0.0
-        self._running_mean_y = 0.0
-        self._running_var_x = 1.0
-        self._running_var_y = 1.0
-        self._n_seen = 0
-
-    @property
-    def elapsed(self) -> float:
-        return time.time() - self._start
-
-    @staticmethod
-    def _median(buf: collections.deque) -> float:
-        s = sorted(buf)
-        n = len(s)
-        if n == 0:
-            return 0.0
-        if n % 2 == 1:
-            return s[n // 2]
-        return (s[n // 2 - 1] + s[n // 2]) / 2.0
-
-    def sample_once(self) -> bool:
-        """Берёт один отсчёт, если прошёл нужный интервал.
-        Применяет медианный фильтр и отсечение выбросов.
-        """
-        now = time.time()
-        if now - self._last_sample < self._interval:
-            return False
-        self._last_sample = now
-
-        xv = self._dev.get(self._xcode)
-        yv = self._dev.get(self._ycode)
-        if xv[0] is None or yv[0] is None:
-            return False
-
-        az = self._cfg["axis_zero"]
-        us = self._cfg["unit_scale"]
-        x_raw = (float(xv[0]) - az) * self._cfg["scale_x"] * us + self._cfg["offset_x"]
-        y_raw = (float(yv[0]) - az) * self._cfg["scale_y"] * us + self._cfg["offset_y"]
-
-        last_ts = max(xv[1], yv[1])
-        contact = 1.0 if (now - last_ts) < self._cfg["contact_timeout"] else 0.0
-
-        # Отсечение выбросов: если отклонение > outlier_sigma * sqrt(дисперсия) —
-        # пропускаем точку (только если накопили достаточно данных)
-        if self._n_seen >= 10 and self._outlier_sigma > 0:
-            dx = abs(x_raw - self._running_mean_x)
-            dy = abs(y_raw - self._running_mean_y)
-            std_x = max(self._running_var_x, 1e-10) ** 0.5
-            std_y = max(self._running_var_y, 1e-10) ** 0.5
-            if dx > self._outlier_sigma * std_x or dy > self._outlier_sigma * std_y:
-                return False
-
-        # Медианный фильтр
-        self._buf_x.append(x_raw)
-        self._buf_y.append(y_raw)
-        x = self._median(self._buf_x)
-        y = self._median(self._buf_y)
-
-        # Бегущее среднее и дисперсия (exponential moving average)
-        alpha = 0.02
-        self._n_seen += 1
-        self._running_mean_x += alpha * (x - self._running_mean_x)
-        self._running_mean_y += alpha * (y - self._running_mean_y)
-        self._running_var_x += alpha * ((x - self._running_mean_x) ** 2 - self._running_var_x)
-        self._running_var_y += alpha * ((y - self._running_mean_y) ** 2 - self._running_var_y)
-
-        with self._lock:
-            self._samples.append((now - self._start, x, y, contact))
-        return True
-
-    def sample_loop(self):
-        """Фоновый поток выборки."""
-        while self.running:
-            self.sample_once()
-            time.sleep(0.001)
-
-    def snapshot(self) -> np.ndarray:
-        """Потокобезопасная копия всех накопленных отсчётов (N×4)."""
-        with self._lock:
-            if not self._samples:
-                return np.empty((0, 4))
-            return np.array(self._samples)
-
-    def to_array(self) -> np.ndarray:
-        return self.snapshot()
-
-    def stop(self):
-        self.running = False
-
-
-def compute_metrics(arr: np.ndarray) -> dict | None:
-    """Вычисляет стабилографические показатели из массива N×4 [t, x, y, contact]."""
-    if arr.size == 0:
-        return None
-    t, x, y, c = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
-    sel = c > 0.5
-    used_all = not sel.any()
-    if used_all:
-        sel = np.ones(len(c), dtype=bool)
-    xx, yy, tt = x[sel], y[sel], t[sel]
-    if len(xx) < 2:
-        return dict(n=int(len(xx)), T=0.0,
-                    xm=float(xx.mean()) if len(xx) else 0.0,
-                    ym=float(yy.mean()) if len(yy) else 0.0,
-                    sx=0.0, sy=0.0, maxdev_x=0.0, maxdev_y=0.0,
-                    range_x=0.0, range_y=0.0, L=0.0, vel=0.0, rms=0.0,
-                    no_contact=used_all)
-    xm, ym = xx.mean(), yy.mean()
-    dx, dy = np.diff(xx), np.diff(yy)
-    L = float(np.sqrt(dx**2 + dy**2).sum())
-    T = float(tt[-1] - tt[0])
-    return dict(
-        n=int(len(xx)), T=T,
-        xm=float(xm), ym=float(ym),
-        sx=float(xx.std()), sy=float(yy.std()),
-        maxdev_x=float(np.abs(xx - xm).max()),
-        maxdev_y=float(np.abs(yy - ym).max()),
-        range_x=float(xx.max() - xx.min()),
-        range_y=float(yy.max() - yy.min()),
-        L=L, vel=L / T if T > 0 else 0.0,
-        rms=float(np.sqrt(((xx - xm)**2 + (yy - ym)**2).mean())),
-        no_contact=used_all,
-    )
-
-
-def save_csv(arr: np.ndarray, path: str, meta: dict | None = None,
-             t_start: float | None = None, t_end: float | None = None):
-    if not path:
-        return
-    import datetime
-    from pathlib import Path as _Path
-    _Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as f:
-        if meta:
-            if meta.get("id"):
-                f.write(f"#ID,{meta['id']}\n")
-            if meta.get("gender"):
-                f.write(f"#Gender,{meta['gender']}\n")
-            if meta.get("age"):
-                f.write(f"#Age,{meta['age']}\n")
-        if t_start is not None:
-            utc_start = datetime.datetime.fromtimestamp(t_start, tz=datetime.timezone.utc)
-            f.write(f"#Start_UTC,{utc_start.strftime('%Y-%m-%dT%H:%M:%S.%f')}Z\n")
-        if t_end is not None:
-            utc_end = datetime.datetime.fromtimestamp(t_end, tz=datetime.timezone.utc)
-            f.write(f"#End_UTC,{utc_end.strftime('%Y-%m-%dT%H:%M:%S.%f')}Z\n")
-        f.write("#Time,X,Y\n")
-        for row in arr:
-            f.write(f"{row[0]:.3f},{row[1]:.3f},{row[2]:.3f}\n")
-
-
-def _build_csv_path(base_path: str, meta: dict | None = None,
-                    t_start: float | None = None) -> str:
-    """Создаёт имя CSV-файла: base_YYYYMMDD_HHMMSS[_ID][_G][_Age].csv"""
-    import datetime
-    import os
-    base, ext = os.path.splitext(base_path)
-    parts = [base]
-    if t_start is not None:
-        utc = datetime.datetime.fromtimestamp(t_start, tz=datetime.timezone.utc)
-        parts.append(utc.strftime("%Y%m%d_%H%M%S"))
-    if meta:
-        if meta.get("id"):
-            parts.append(str(meta["id"]).replace(" ", "_"))
-        if meta.get("gender"):
-            parts.append(str(meta["gender"]))
-        if meta.get("age"):
-            parts.append(str(meta["age"]))
-    return "_".join(parts) + ext
-
-
-def print_summary(m: dict | None):
-    if not m:
-        print("Нет данных для анализа.")
-        return
-    print("=== Стабилографические показатели ===")
-    rows = [
-        ("Число отсчётов (контакт)", f"{m['n']}"),
-        ("Длительность записи, с",   f"{m['T']:.2f}"),
-        ("Среднее положение X / Y",  f"{m['xm']:.2f} / {m['ym']:.2f}"),
-        ("σ по X / по Y",            f"{m['sx']:.2f} / {m['sy']:.2f}"),
-        ("max откл. X / Y",          f"{m['maxdev_x']:.2f} / {m['maxdev_y']:.2f}"),
-        ("Размах X / Y",             f"{m['range_x']:.2f} / {m['range_y']:.2f}"),
-        ("Длина тракта L",           f"{m['L']:.2f}"),
-        ("Средняя скорость",         f"{m['vel']:.2f} ед/с"),
-        ("RMS отклонение",           f"{m['rms']:.2f}"),
-    ]
-    w = max(len(r[0]) for r in rows)
-    for label, val in rows:
-        print(f"  {label:<{w}} : {val}")
-    if m.get("no_contact"):
-        print("  ВНИМАНИЕ: контакт не обнаружен — использованы все точки")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -694,33 +111,6 @@ def xinput_isolated(name_substr: str, keep_disabled: list[bool] | None = None):
         if xid is not None and not should_keep:
             _run_quietly(["xinput", "enable", str(xid)])
         _set_xkb_layout(layout)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Конфигурация
-# ══════════════════════════════════════════════════════════════════════════════
-
-_CFG_DEFAULTS: dict = {
-    "xcode": 0, "ycode": 1, "rate": 50.0,
-    "contact_timeout": 0.5, "calibrate": 2.0,
-    "scale_x": 1.0, "scale_y": 1.0,
-    "offset_x": 0.0, "offset_y": 0.0,
-    "axis_zero": 128,
-    "unit_scale": 0.1,
-    "median_window": 3,
-    "outlier_sigma": 5.0,
-    "device": None, "max_x": None, "max_y": None,
-}
-
-
-def load_config(path: str | None) -> dict:
-    cfg = dict(_CFG_DEFAULTS)
-    if path:
-        with open(path) as f:
-            cfg.update(json.load(f))
-    cfg["rate"] = max(float(cfg.get("rate") or 50.0), 0.1)
-    cfg["contact_timeout"] = float(cfg["contact_timeout"])
-    return cfg
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1075,7 +465,7 @@ class StabiloUI:
         m   = compute_metrics(arr)
         t_start = self._buf._start
         t_end = time.time()
-        out_path = _build_csv_path(self._out_path, meta=self.meta, t_start=t_start)
+        out_path = build_csv_path(self._out_path, meta=self.meta, t_start=t_start)
         save_csv(arr, out_path, meta=self.meta, t_start=t_start, t_end=t_end)
         print_summary(m)
         print(f"\nCSV: {out_path}")
@@ -1109,7 +499,7 @@ def run_headless(buf: DataBuffer, duration: float, out_path: str,
     m = compute_metrics(arr)
     t_start = buf._start
     t_end = time.time()
-    out_path = _build_csv_path(out_path, meta=meta, t_start=t_start)
+    out_path = build_csv_path(out_path, meta=meta, t_start=t_start)
     save_csv(arr, out_path, meta=meta, t_start=t_start, t_end=t_end)
     print_summary(m)
     print(f"\nCSV: {out_path}")
@@ -1180,6 +570,8 @@ def main(argv=None):
     ap.add_argument("--unit-scale", type=float, default=0, help="масштаб единиц (0.01=деление на 100, мм)")
     ap.add_argument("--median",   type=int, default=0,    help="окно медианного фильтра (0=3)")
     ap.add_argument("--outlier",  type=float, default=0,  help="порог выбросов в sigma (0=5.0)")
+    ap.add_argument("--no-filter", action="store_true",
+                    help="отключить медианный фильтр и отсечение выбросов")
     ap.add_argument("--debug",    action="store_true",    help="hex-dump сырых HID-пакетов")
     ap.add_argument("command",    nargs="?", default="live",
                     choices=["live", "list", "sniff"], help="режим: live/list/sniff")
@@ -1197,6 +589,9 @@ def main(argv=None):
         cfg["median_window"] = args.median
     if args.outlier > 0:
         cfg["outlier_sigma"] = args.outlier
+    if args.no_filter:
+        cfg["median_window"] = 1
+        cfg["outlier_sigma"] = 0
 
     if args.command == "sniff":
         _cmd_sniff(args)

@@ -105,6 +105,15 @@ def load_stabilogram(file_path: Path) -> pd.DataFrame:
     if 'Time' not in df.columns:
         logger.warning("Колонка 'Time' не найдена. Создана искусственная ось времени (50 Гц).")
         df['Time'] = np.arange(len(df)) / 50.0
+    else:
+        # Time сохраняется в unix-формате (timestamp) — нормализуем к
+        # относительному времени от 0 для расчётов и графиков.
+        # Старые файлы с относительным временем не затрагиваются.
+        try:
+            if len(df) and float(df['Time'].iloc[0]) > 1e9:
+                df['Time'] = df['Time'] - df['Time'].iloc[0]
+        except (TypeError, ValueError):
+            pass
 
     return df
 
@@ -589,7 +598,8 @@ def main(argv=None):
     )
     parser.add_argument('input_file', type=str, nargs='?',
                         help='Путь к файлу стабилограммы (CSV/XLSX); без него — интерактивный выбор')
-    parser.add_argument('-o', '--output_dir', type=str, default='.', help='Директория для отчётов')
+    parser.add_argument('-o', '--output_dir', type=str, default=None,
+                        help='Директория для отчётов (по умолчанию — каталог анализируемого файла)')
     parser.add_argument('--dir', type=str, default=None,
                         help='Каталог для интерактивного выбора (по умолчанию records/)')
     parser.add_argument('--age', type=int, default=None, help='Возраст пациента (для нормограммы, необязательно)')
@@ -615,7 +625,7 @@ def main(argv=None):
         logger.info(str(e))
         return
     input_path = Path(input_file)
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:

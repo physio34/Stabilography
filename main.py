@@ -3,8 +3,8 @@
 
 Использование:
     python main.py                          # интерактивное меню
-    python main.py record [opts]            # запись (консоль/matplotlib, modules/record.py)
-    python main.py gui [opts]               # запись (Dear PyGui, modules/gui.py)
+    python main.py record [opts]            # запись (консоль/matplotlib, modules/ui_cli.py)
+    python main.py gui [opts]               # запись (Dear PyGui, modules/ui_gui.py)
     python main.py analyze [file] [opts]    # расширенный анализ (modules/extended.py)
     python main.py quick [file] [opts]      # быстрый анализ (modules/analyze.py)
     python main.py list                     # поиск устройства MERA
@@ -28,12 +28,12 @@ def _print_help():
 
 
 def _cmd_record(argv):
-    from modules.record import main as record_main
+    from modules.ui_cli import main as record_main
     record_main(argv)
 
 
 def _cmd_gui(argv):
-    from modules.gui import main as gui_main
+    from modules.ui_gui import main as gui_main
     gui_main(argv)
 
 
@@ -47,7 +47,7 @@ def _cmd_analyze(argv, quick=False):
 
 
 def _cmd_list(_argv):
-    from modules.record import discover_device
+    from modules.core import discover_device
     d = discover_device()
     if d:
         print(console.c_green("Найдено устройство:"), console.c_cyan(d))

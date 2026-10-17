@@ -11,8 +11,14 @@ HTML-отчётами (траектория + 95% эллипс, временны
 adStabilo/
 ├── main.py              # Точка входа: цветное меню + CLI
 ├── modules/
-│   ├── record.py        # Запись (консоль/matplotlib, headless)
-│   ├── gui.py           # Запись (GUI Dear PyGui)
+│   ├── core/            # Общее ядро записи
+│   │   ├── device.py    # Device, поиск MERA, валидация
+│   │   ├── sampling.py  # DataBuffer, калибровка осей
+│   │   ├── metrics.py   # compute_metrics, print_summary
+│   │   ├── io_csv.py    # save_csv, build_csv_path
+│   │   └── defaults.py  # load_config (единые дефолты)
+│   ├── ui_cli.py        # Запись (консоль/matplotlib, headless)
+│   ├── ui_gui.py        # Запись (GUI Dear PyGui)
 │   ├── analyze.py       # Быстрый анализ  → <имя>_report.html
 │   ├── extended.py      # Расширенный анализ → <имя>_extended_report.html
 │   ├── file_select.py   # Интерактивный выбор файлов
@@ -76,7 +82,7 @@ python main.py -f records/stabilo.csv --age 30 --gender male
 Прямой запуск модулей тоже работает:
 
 ```bash
-python -m modules.record list
+python -m modules.ui_cli list
 python -m modules.extended --help
 python -m modules.analyze --help
 ```
