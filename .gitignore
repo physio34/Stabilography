@@ -63,5 +63,7 @@ temp/
 __pypackages__/
 *.xlsx
 *.ipynb
+*.zip
 analyzer_session.json
+records/*
 results/*
